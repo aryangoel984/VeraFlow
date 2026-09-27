@@ -97,6 +97,7 @@ class HealthzResponse(BaseModel):
     status: Literal["ok"] = "ok"
     uptime_seconds: int
     contexts_loaded: ContextsLoaded
+    llm_configured: bool = False
 
 
 class MetadataResponse(BaseModel):
