@@ -15,12 +15,18 @@ Usage:
     python scripts/smoke_test.py                    # tests localhost:8080
     BOT_URL=https://your-deployed-bot.com python scripts/smoke_test.py
 
-No API key required — every check works whether or not ANTHROPIC_API_KEY is
-set on the server (with a key, messages will read more naturally; without
-one, they'll be plainer but still pass every check here).
+No API key required — every check works whether or not GROQ_API_KEY is set
+on the server (with a key, messages will read more naturally; without one,
+they'll be plainer but still pass every check here).
+
+Safe to re-run repeatedly against the SAME long-lived server (e.g. a
+production deployment): every context version, trigger id, suppression key,
+and conversation id used below is derived from the current timestamp, so a
+fresh run never collides with state left over from a previous run.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
@@ -31,6 +37,7 @@ import httpx
 
 BOT_URL = os.environ.get("BOT_URL", "http://localhost:8080")
 DATASET_DIR = Path(__file__).parent.parent / "dataset"
+RUN_ID = str(int(time.time()))
 
 PASS = "\033[92mPASS\033[0m"
 FAIL = "\033[91mFAIL\033[0m"
@@ -88,19 +95,25 @@ def main() -> None:
             "payload": payload, "delivered_at": "2026-04-26T09:45:00Z",
         })
 
-    r = push("category", "dentists", 1, dentists)
-    check("push category v1 -> 200 accepted", r.status_code == 200 and r.json().get("accepted") is True)
+    # Timestamp-based versions: guaranteed higher than anything a previous
+    # run of this script (or earlier manual testing) could have pushed, so
+    # these checks work whether the server is fresh or has been running for
+    # days with other data already in it.
+    v0 = int(time.time())
 
-    r = push("merchant", dr_meera["merchant_id"], 1, dr_meera)
-    check("push merchant v1 -> 200 accepted", r.status_code == 200 and r.json().get("accepted") is True)
+    r = push("category", "dentists", v0, dentists)
+    check("push category vN -> 200 accepted", r.status_code == 200 and r.json().get("accepted") is True)
 
-    r = push("merchant", dr_meera["merchant_id"], 1, dr_meera)
+    r = push("merchant", dr_meera["merchant_id"], v0, dr_meera)
+    check("push merchant vN -> 200 accepted", r.status_code == 200 and r.json().get("accepted") is True)
+
+    r = push("merchant", dr_meera["merchant_id"], v0, dr_meera)
     check("re-push SAME version -> 409 stale_version", r.status_code == 409 and r.json().get("reason") == "stale_version")
 
-    r = push("merchant", dr_meera["merchant_id"], 2, dr_meera)
+    r = push("merchant", dr_meera["merchant_id"], v0 + 1, dr_meera)
     check("push HIGHER version -> 200 accepted (replaces)", r.status_code == 200 and r.json().get("accepted") is True)
 
-    r = push("merchant", dr_meera["merchant_id"], 1, dr_meera)
+    r = push("merchant", dr_meera["merchant_id"], v0, dr_meera)
     check("push LOWER version after a higher one -> 409", r.status_code == 409)
 
     r = client.post("/v1/context", json={"scope": "not_a_real_scope", "context_id": "x", "version": 1,
@@ -127,7 +140,12 @@ def main() -> None:
     r = client.post("/v1/tick", json={"now": "2026-04-26T10:30:00Z", "available_triggers": ["trg_totally_made_up"]})
     check("tick with unknown trigger id -> no crash, empty actions", r.status_code == 200 and r.json()["actions"] == [])
 
-    trg_research = next(t for t in triggers if t["id"] == "trg_001_research_digest_dentists")
+    # Fresh copies with unique id + suppression_key per run — same real,
+    # grounded payload, but never collides with a previous run's suppression
+    # state (which persists in the server forever, by design).
+    trg_research = copy.deepcopy(next(t for t in triggers if t["id"] == "trg_001_research_digest_dentists"))
+    trg_research["id"] = f"trg_smoketest_research_{RUN_ID}"
+    trg_research["suppression_key"] = f"research:dentists:smoketest:{RUN_ID}"
     push("trigger", trg_research["id"], 1, trg_research)
 
     r1 = client.post("/v1/tick", json={"now": "2026-04-26T10:35:00Z", "available_triggers": [trg_research["id"]]})
@@ -146,13 +164,24 @@ def main() -> None:
     r2 = client.post("/v1/tick", json={"now": "2026-04-26T10:40:00Z", "available_triggers": [trg_research["id"]]})
     check("same trigger fired again -> suppressed, 0 actions (no spam)", r2.json()["actions"] == [])
 
-    trg_recall = next(t for t in triggers if t["id"] == "trg_003_recall_due_priya")
+    # Priya's real profile data, but under a fresh per-run customer_id. Once
+    # pushed, a customer_id lives in server memory forever (by design — the
+    # judge relies on this), so re-using her fixed dataset id here would only
+    # let the "not pushed yet" half of this test be true on the very first
+    # run against a given server.
+    priya_synthetic = copy.deepcopy(priya)
+    priya_synthetic["customer_id"] = f"c_smoketest_priya_{RUN_ID}"
+
+    trg_recall = copy.deepcopy(next(t for t in triggers if t["id"] == "trg_003_recall_due_priya"))
+    trg_recall["id"] = f"trg_smoketest_recall_{RUN_ID}"
+    trg_recall["customer_id"] = priya_synthetic["customer_id"]
+    trg_recall["suppression_key"] = f"recall:c_001_priya_for_m001:smoketest:{RUN_ID}"
     push("trigger", trg_recall["id"], 1, trg_recall)
     r3 = client.post("/v1/tick", json={"now": "2026-04-26T11:00:00Z", "available_triggers": [trg_recall["id"]]})
     check("customer-scoped trigger with NO customer context pushed -> refuses to send",
           r3.json()["actions"] == [], "must not fabricate a customer-facing message")
 
-    push("customer", priya["customer_id"], 1, priya)
+    push("customer", priya_synthetic["customer_id"], 1, priya_synthetic)
     r4 = client.post("/v1/tick", json={"now": "2026-04-26T11:05:00Z", "available_triggers": [trg_recall["id"]]})
     actions4 = r4.json().get("actions", [])
     check("same trigger AFTER customer context pushed -> now sends", len(actions4) == 1)
@@ -171,29 +200,30 @@ def main() -> None:
     auto_msg = "Thank you for contacting us! Our team will respond shortly."
     seen = []
     for i in range(1, 5):
-        r = reply("conv_smoke_auto", auto_msg, i + 1)
+        r = reply(f"conv_smoke_auto_{RUN_ID}", auto_msg, i + 1)
         seen.append(r.json().get("action"))
         if seen[-1] == "end":
             break
     check("auto-reply x4 escalates send -> wait -> end", seen == ["send", "wait", "end"], f"got {seen}")
 
-    r = reply("conv_smoke_hostile", "Stop messaging me. This is useless spam.", 2)
+    r = reply(f"conv_smoke_hostile_{RUN_ID}", "Stop messaging me. This is useless spam.", 2)
     check("hostile reply -> action=end", r.json().get("action") == "end")
 
-    r = reply("conv_smoke_reject", "Not interested, please don't send this.", 2)
+    r = reply(f"conv_smoke_reject_{RUN_ID}", "Not interested, please don't send this.", 2)
     check("soft rejection -> action=end", r.json().get("action") == "end")
 
-    r = reply("conv_smoke_defer", "Maybe next week, I'm busy right now.", 2)
+    r = reply(f"conv_smoke_defer_{RUN_ID}", "Maybe next week, I'm busy right now.", 2)
     check("deferral -> action=wait with wait_seconds", r.json().get("action") == "wait" and r.json().get("wait_seconds", 0) > 0)
 
-    r = reply("conv_smoke_intent", "Ok lets do it. Whats next?", 2)
+    r = reply(f"conv_smoke_intent_{RUN_ID}", "Ok lets do it. Whats next?", 2)
     body = (r.json().get("body") or "").lower()
     check("explicit acceptance -> action=send", r.json().get("action") == "send")
     check("acceptance response does NOT re-ask a qualifying question",
           not any(p in body for p in ("would you say", "do you think", "how about")))
 
-    r1 = reply("conv_smoke_ended", "Not interested. Stop messaging me.", 2)
-    r2 = reply("conv_smoke_ended", "Wait, actually tell me more", 3)
+    ended_conv = f"conv_smoke_ended_{RUN_ID}"
+    reply(ended_conv, "Not interested. Stop messaging me.", 2)
+    r2 = reply(ended_conv, "Wait, actually tell me more", 3)
     check("replying again on an already-ended conversation -> stays ended", r2.json().get("action") == "end")
 
     # -------------------------------------------------------------------
