@@ -15,13 +15,26 @@ from typing import Optional
 
 import httpx
 
-DEFAULT_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-oss-120b")
+DEFAULT_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-oss-120b").strip()
 LLM_TIMEOUT_SECONDS = float(os.environ.get("LLM_TIMEOUT_SECONDS", "8"))
 GROQ_CHAT_COMPLETIONS_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
+def _get_api_key() -> Optional[str]:
+    """Some dashboards (Railway included) can silently include a trailing
+    newline/whitespace when a value is pasted in — that turns 'Bearer <key>'
+    into an illegal HTTP header value, failing every request instantly while
+    still reporting the key as "present". Always strip before use."""
+    key = os.environ.get("GROQ_API_KEY", "").strip()
+    return key or None
+
+
 def is_available() -> bool:
-    return bool(os.environ.get("GROQ_API_KEY"))
+    return _get_api_key() is not None
+
+
+def _redact(text: str, secret: Optional[str]) -> str:
+    return text.replace(secret, "***REDACTED***") if secret else text
 
 
 async def diagnostic_ping() -> dict:
@@ -30,7 +43,7 @@ async def diagnostic_ping() -> dict:
     complete_json(), this does NOT swallow the exception, so it can surface
     the real cause (bad key, network egress blocked, timeout, bad model id)
     instead of the silent None that composer.py relies on in production."""
-    api_key = os.environ.get("GROQ_API_KEY")
+    api_key = _get_api_key()
     if not api_key:
         return {"ok": False, "stage": "no_key", "detail": "GROQ_API_KEY is not set or empty"}
     try:
@@ -47,17 +60,17 @@ async def diagnostic_ping() -> dict:
                 },
             )
     except Exception as exc:
-        return {"ok": False, "stage": "request_failed", "detail": f"{type(exc).__name__}: {exc}"}
+        return {"ok": False, "stage": "request_failed", "detail": _redact(f"{type(exc).__name__}: {exc}", api_key)}
 
     if response.status_code != 200:
         return {"ok": False, "stage": "non_200_response", "status_code": response.status_code,
-                "detail": response.text[:500]}
+                "detail": _redact(response.text[:500], api_key)}
     try:
         data = response.json()
         text = data["choices"][0]["message"]["content"]
     except Exception as exc:
-        return {"ok": False, "stage": "unparseable_response", "detail": f"{type(exc).__name__}: {exc}",
-                "raw": response.text[:500]}
+        return {"ok": False, "stage": "unparseable_response", "detail": _redact(f"{type(exc).__name__}: {exc}", api_key),
+                "raw": _redact(response.text[:500], api_key)}
 
     return {"ok": True, "stage": "success", "model": DEFAULT_MODEL, "content": text,
             "key_prefix": api_key[:8] + "..." if len(api_key) > 8 else "(short/invalid key)"}
@@ -77,7 +90,7 @@ async def complete_json(system: str, prompt: str, max_tokens: int = 900) -> Opti
     for a phrasing task with no real reasoning to do, and `max_tokens` is
     sized with headroom on top of that.
     """
-    api_key = os.environ.get("GROQ_API_KEY")
+    api_key = _get_api_key()
     if not api_key:
         return None
     try:
