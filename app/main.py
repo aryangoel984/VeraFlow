@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 
 load_dotenv()  # no-op if .env doesn't exist; real deploys set env vars directly
 
-from app.api import context, health, metadata, reply, teardown, tick  # noqa: E402
+from app.api import context, debug, health, metadata, reply, teardown, tick  # noqa: E402
 
 app = FastAPI(title="Vera Message Engine", version="1.0.0")
 
@@ -18,6 +18,7 @@ app.include_router(context.router)
 app.include_router(tick.router)
 app.include_router(reply.router)
 app.include_router(teardown.router)
+app.include_router(debug.router)
 
 
 @app.exception_handler(Exception)

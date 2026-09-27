@@ -24,6 +24,45 @@ def is_available() -> bool:
     return bool(os.environ.get("GROQ_API_KEY"))
 
 
+async def diagnostic_ping() -> dict:
+    """Attempts one real, minimal completion and reports exactly what
+    happened — used only by the /v1/debug/llm endpoint. Unlike
+    complete_json(), this does NOT swallow the exception, so it can surface
+    the real cause (bad key, network egress blocked, timeout, bad model id)
+    instead of the silent None that composer.py relies on in production."""
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        return {"ok": False, "stage": "no_key", "detail": "GROQ_API_KEY is not set or empty"}
+    try:
+        async with httpx.AsyncClient(timeout=LLM_TIMEOUT_SECONDS) as client:
+            response = await client.post(
+                GROQ_CHAT_COMPLETIONS_URL,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": DEFAULT_MODEL,
+                    "temperature": 0,
+                    "max_tokens": 50,
+                    "reasoning_effort": "low",
+                    "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
+                },
+            )
+    except Exception as exc:
+        return {"ok": False, "stage": "request_failed", "detail": f"{type(exc).__name__}: {exc}"}
+
+    if response.status_code != 200:
+        return {"ok": False, "stage": "non_200_response", "status_code": response.status_code,
+                "detail": response.text[:500]}
+    try:
+        data = response.json()
+        text = data["choices"][0]["message"]["content"]
+    except Exception as exc:
+        return {"ok": False, "stage": "unparseable_response", "detail": f"{type(exc).__name__}: {exc}",
+                "raw": response.text[:500]}
+
+    return {"ok": True, "stage": "success", "model": DEFAULT_MODEL, "content": text,
+            "key_prefix": api_key[:8] + "..." if len(api_key) > 8 else "(short/invalid key)"}
+
+
 async def complete_json(system: str, prompt: str, max_tokens: int = 900) -> Optional[dict]:
     """Calls the LLM and parses a JSON object out of the response. Returns
     None on any failure (missing key, timeout, malformed output) so the
