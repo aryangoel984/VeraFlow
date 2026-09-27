@@ -357,8 +357,14 @@ def sel_active_planning_intent(t, category, merchant, customer, now):
     topic, last_msg = p.get("intent_topic"), p.get("merchant_last_message")
     if not topic:
         return AnchorResult(ok=False, skip_reason="no planning-intent topic in trigger payload")
-    facts = {"intent_topic": topic, "merchant_last_message": last_msg}
-    summary = f'Merchant is actively planning: "{topic}".'
+    # intent_topic is an internal snake_case identifier (e.g.
+    # "corporate_bulk_thali_package"), never meant to be read as-is -- render
+    # it as plain words for the summary/prompt so it doesn't leak into the
+    # composed message verbatim. The merchant's own last_message (real,
+    # already-natural text) remains the stronger anchor either way.
+    topic_readable = str(topic).replace("_", " ")
+    facts = {"intent_topic": topic_readable, "merchant_last_message": last_msg}
+    summary = f'Merchant is actively planning: {topic_readable}.'
     if last_msg:
         summary += f' Their last message: "{last_msg}".'
     return AnchorResult(ok=True, summary=summary, facts=facts)
